@@ -5,11 +5,17 @@
 
 param (
     [switch]$BackupOnly,
+    [switch]$DryRun,
     [switch]$NonInteractive
 )
 
-$ErrorActionPreference = 'SilentlyContinue'
-$WarningPreference = 'SilentlyContinue'
+# --- 解决 PowerShell 输出乱码 ---
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+[Console]::InputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+
+$ErrorActionPreference = 'Continue'
+$WarningPreference = 'Continue'
 
 # --- 核心数据结构 ---
 # 结构: @{ "WinGet" = @{ "Manager" = @(); "Apps" = @() } }
@@ -18,12 +24,18 @@ $Global:DiscoveryData = @{}
 function Get-EnvPath {
     param([System.EnvironmentVariableTarget]$Target)
     $path = [Environment]::GetEnvironmentVariable('Path', $Target)
-    return if (-not $path) { @() } else { $path.Split(';', [System.StringSplitOptions]::RemoveEmptyEntries) }
+    if (-not $path) { return @() }
+    return $path.Split(';', [System.StringSplitOptions]::RemoveEmptyEntries)
 }
 
 function Set-EnvPath {
     param([System.EnvironmentVariableTarget]$Target, [string[]]$PathArray)
-    [Environment]::SetEnvironmentVariable('Path', ($PathArray -join ';'), $Target)
+    $newPath = $PathArray -join ';'
+    if ($DryRun) {
+        Write-Host "[DryRun] Would set $Target Path ($($PathArray.Count) items)" -ForegroundColor Yellow
+        return
+    }
+    [Environment]::SetEnvironmentVariable('Path', $newPath, $Target)
 }
 
 function Invoke-BackupPath {
@@ -58,8 +70,26 @@ function Add-Path {
 
 function Get-OrderedTargetPaths {
     $allPaths = New-Object System.Collections.Generic.List[string]
+    
+    $commands = @{
+        "WinGet" = "winget"; "Scoop" = "scoop"; "Choco" = "choco";
+        "Npm" = "npm"; "Pip" = "pip"; "Cargo" = "cargo";
+        "vcpkg" = "vcpkg"; "dotnet" = "dotnet"; "PS7" = "pwsh";
+        "PS5" = "powershell"
+    }
 
-    # 1. WinGet
+    # 1. First, check if commands are already in PATH and add them
+    foreach ($name in $commands.Keys) {
+        $cmd = $commands[$name]
+        $found = Get-Command $cmd -ErrorAction SilentlyContinue
+        if ($found) {
+            $res = Add-Path $name "Manager" (Split-Path $found.Path)
+            if ($res) { $allPaths.Add($res) }
+        }
+    }
+
+    # 2. Add well-known paths
+    # WinGet
     $res = Add-Path "WinGet" "Manager" "$env:LOCALAPPDATA\Microsoft\WindowsApps"
     if ($res) { $allPaths.Add($res) }
     $wingetPkg = "$env:LOCALAPPDATA\Microsoft\WinGet\Packages"
@@ -72,15 +102,15 @@ function Get-OrderedTargetPaths {
         }
     }
 
-    # 2. Scoop
+    # Scoop
     $scoopBase = if ($env:SCOOP) { $env:SCOOP } else { "$env:USERPROFILE\scoop" }
     $res = Add-Path "Scoop" "Manager" "$scoopBase\shims"; if ($res) { $allPaths.Add($res) }
-    $res = Add-Path "Scoop" "Apps" "$scoopBase\apps"; if ($res) { $allPaths.Add($res) } # Scoop apps root for reference
+    $res = Add-Path "Scoop" "Apps" "$scoopBase\apps"; if ($res) { $allPaths.Add($res) }
 
-    # 3. Chocolatey
+    # Chocolatey
     $res = Add-Path "Choco" "Manager" "$env:ALLUSERSPROFILE\chocolatey\bin"; if ($res) { $allPaths.Add($res) }
 
-    # 4. Npm
+    # Npm
     $res = Add-Path "Npm" "Manager" "$env:ProgramFiles\nodejs"; if ($res) { $allPaths.Add($res) }
     try {
         $npmPrefix = (npm config get prefix).Trim()
@@ -91,7 +121,7 @@ function Get-OrderedTargetPaths {
     } catch {}
     $res = Add-Path "Npm" "Apps" "$env:APPDATA\npm"; if ($res) { $allPaths.Add($res) }
 
-    # 5. Pip
+    # Pip
     $pythonBase = "$env:LOCALAPPDATA\Programs\Python"
     if (Test-Path $pythonBase) {
         Get-ChildItem -Path $pythonBase -Directory | ForEach-Object { 
@@ -104,20 +134,20 @@ function Get-OrderedTargetPaths {
         if ($pyUserBase) { $res = Add-Path "Pip" "Apps" (Join-Path $pyUserBase "Scripts"); if ($res) { $allPaths.Add($res) } }
     } catch {}
 
-    # 6. Cargo
-    $res = Add-Path "Cargo" "Manager" "$env:USERPROFILE\.cargo\bin"; if ($res) { $allPaths.Add($res) } # Cargo apps are in bin
+    # Cargo
+    $res = Add-Path "Cargo" "Manager" "$env:USERPROFILE\.cargo\bin"; if ($res) { $allPaths.Add($res) }
 
-    # 7. vcpkg
+    # vcpkg
     $vcpkgPaths = @($env:VCPKG_ROOT, "C:\vcpkg", "$env:USERPROFILE\vcpkg")
     foreach ($p in $vcpkgPaths) { if ($p) { $res = Add-Path "vcpkg" "Manager" $p; if ($res) { $allPaths.Add($res) } } }
 
-    # 8. .NET Tool
+    # .NET Tool
     $res = Add-Path "dotnet" "Manager" "$env:USERPROFILE\.dotnet\tools"; if ($res) { $allPaths.Add($res) }
 
-    # 9. PS7
+    # PS7
     $res = Add-Path "PS7" "Manager" "$env:ProgramFiles\PowerShell\7"; if ($res) { $allPaths.Add($res) }
 
-    # 10. PS5
+    # PS5
     $res = Add-Path "PS5" "Manager" "$env:SystemRoot\System32\WindowsPowerShell\v1.0"; if ($res) { $allPaths.Add($res) }
 
     return $allPaths | Select-Object -Unique
@@ -136,28 +166,32 @@ function Show-RepairReport {
     $order = @("WinGet","Scoop","Choco","Npm","Pip","Cargo","vcpkg","dotnet","PS7","PS5")
 
     Write-Host "`n" + ("="*80) -ForegroundColor Cyan
-    Write-Host "             WINPATHFIX HIERARCHICAL REPAIR REPORT             " -ForegroundColor Cyan
+    Write-Host "                 WINPATHFIX: HIERARCHICAL REPAIR REPORT                 " -ForegroundColor Cyan
     Write-Host ("="*80) -ForegroundColor Cyan
     
+    $stats = @{ "Found" = 0; "Missing" = 0; "Packages" = 0 }
+
     foreach ($name in $order) {
         $cmd = $commands[$name]
         $found = Get-Command $cmd -ErrorAction SilentlyContinue
         
         # 1. 一级：管理器状态
         if ($found) {
-            Write-Host " [OK] " -NoNewline -ForegroundColor Green
+            Write-Host "  [v] " -NoNewline -ForegroundColor Green
+            $stats["Found"]++
         } else {
-            Write-Host " [!!] " -NoNewline -ForegroundColor Red
+            Write-Host "  [x] " -NoNewline -ForegroundColor Gray
+            $stats["Missing"]++
         }
-        Write-Host "$($name.PadRight(10))" -ForegroundColor White
+        Write-Host "$($name.PadRight(12))" -NoNewline -ForegroundColor White
         
-        if ($Global:DiscoveryData.ContainsKey($name)) {
-            # 2. 一级展示包管理器执行文件的路径
-            $managerExe = $null
-            if ($found) {
-                $managerExe = $found.Path
-            } else {
-                $exts = @('.exe', '.cmd', '.bat', '.ps1', '')
+        # 2. 一级展示包管理器执行文件的路径
+        $managerExe = $null
+        if ($found) {
+            $managerExe = $found.Path
+        } else {
+            $exts = @('.exe', '.cmd', '.bat', '.ps1', '')
+            if ($Global:DiscoveryData.ContainsKey($name)) {
                 foreach ($dir in $Global:DiscoveryData[$name]["Manager"]) {
                     foreach ($ext in $exts) {
                         $testPath = Join-Path $dir "$cmd$ext"
@@ -169,39 +203,33 @@ function Show-RepairReport {
                     if ($managerExe) { break }
                 }
             }
+        }
 
-            if ($managerExe) {
-                Write-Host "      [Manager Executable]" -ForegroundColor DarkCyan
-                Write-Host "      -> $managerExe" -ForegroundColor Gray
-            } elseif ($Global:DiscoveryData[$name]["Manager"].Count -gt 0) {
-                Write-Host "      [Manager Path]" -ForegroundColor DarkCyan
-                foreach ($path in $Global:DiscoveryData[$name]["Manager"]) {
-                    Write-Host "      -> $path" -ForegroundColor Gray
-                }
-            }
+        if ($managerExe) {
+            Write-Host " -> $managerExe" -ForegroundColor DarkGray
+        } else {
+            Write-Host " -> (Not Found)" -ForegroundColor DarkRed
+        }
 
-            # 3. 二级展示通过此包管理器安装的软件包
-            Write-Host "      [Installed Packages]" -ForegroundColor DarkYellow
-            $pkgs = @()
+        if ($Global:DiscoveryData.ContainsKey($name) -or $found) {
+            # 3. 二级展示通过此包管理器安装的软件包（表格形式）
+            $pkgList = @()
             try {
                 if ($found) {
                     switch ($name) {
                         "WinGet" {
-                            $res = winget list --source winget --accept-source-agreements 2>$null
+                            $res = winget list --accept-source-agreements 2>$null
                             $start = $false
-                            $idIdx = -1
                             foreach ($line in $res) {
-                                if (-not $start -and $line -match '\sID\s') {
-                                    $idIdx = $line.IndexOf("ID")
-                                }
                                 if ($line -match "^-+") { $start = $true; continue }
                                 if ($start -and $line.Trim()) {
-                                    if ($idIdx -gt 0 -and $line.Length -gt $idIdx) {
-                                        $info = $line.Substring($idIdx).Trim() -replace '\s{2,}', ' | '
-                                        if ($info) { $pkgs += $info }
-                                    } else {
-                                        $info = $line.Trim() -replace '\s{2,}', ' | '
-                                        if ($info) { $pkgs += $info }
+                                    if ($line -match "^\s*(Name|Version|ID)\s" -or $line -match "^\s*---") { continue }
+                                    $parts = $line -split '\s{2,}'
+                                    if ($parts.Count -ge 3) {
+                                        $pkgName = $parts[0].Trim(); $pkgVer = $parts[2].Trim(); $pkgId = $parts[1].Trim()
+                                        if ($pkgName -and $pkgName -notmatch "^(名称|Name|版本)" -and $pkgName.Length -gt 1) {
+                                            $pkgList += [PSCustomObject]@{ Name = $pkgName; Version = $pkgVer }
+                                        }
                                     }
                                 }
                             }
@@ -209,45 +237,50 @@ function Show-RepairReport {
                         "Scoop" {
                             $res = scoop list 6>$null 2>$null
                             foreach ($item in $res) {
-                                if ($item -and $item.Name) { 
-                                    $info = "$($item.Name) | $($item.Version)"
-                                    if ($item.Source) { $info += " | $($item.Source)" }
-                                    $pkgs += $info 
-                                }
+                                if ($item -and $item.Name) { $pkgList += [PSCustomObject]@{ Name = $item.Name; Version = $item.Version } }
                             }
                         }
                         "Choco" {
                             $res = choco list -l -r 2>$null
                             foreach ($line in $res) {
-                                if ($line.Trim()) { $pkgs += ($line.Trim() -replace '\|', ' | ') }
+                                if ($line.Trim()) {
+                                    $parts = $line.Split('|')
+                                    $pkgList += [PSCustomObject]@{ Name = $parts[0].Trim(); Version = if ($parts.Length -gt 1) { $parts[1].Trim() } else { "" } }
+                                }
                             }
                         }
                         "Npm" {
                             $res = npm ls -g --depth=0 2>$null | Select-Object -Skip 1
                             foreach ($line in $res) {
-                                if ($line -match "(\+--|`--|├──|└──)\s+(.+)") { 
-                                    $pkgs += $matches[2]
+                                if ($line -match "(\+--|`--|├──|└──)\s+(.+)") {
+                                    $pkgList += [PSCustomObject]@{ Name = $matches[2].Trim(); Version = "" }
                                 }
                             }
                         }
                         "Pip" {
-                            $res = pip list -v --format=columns 2>$null | Select-Object -Skip 2
+                            $res = pip list --format=columns 2>$null | Select-Object -Skip 2
                             foreach ($line in $res) {
-                                if ($line.Trim()) { $pkgs += ($line.Trim() -replace '\s{2,}', ' | ') }
+                                if ($line.Trim()) {
+                                    $parts = $line -split '\s{2,}'
+                                    if ($parts.Count -ge 2) { $pkgList += [PSCustomObject]@{ Name = $parts[0].Trim(); Version = $parts[1].Trim() } }
+                                }
                             }
                         }
                         "Cargo" {
                             $res = cargo install --list 2>$null
                             foreach ($line in $res) {
-                                if ($line -match "^([a-zA-Z0-9_-]+)\s+(v[0-9.]+):") { 
-                                    $pkgs += "$($matches[1]) | $($matches[2])" 
+                                if ($line -match "^([a-zA-Z0-9_-]+)\s+(v[0-9.]+):") {
+                                    $pkgList += [PSCustomObject]@{ Name = $matches[1]; Version = $matches[2] }
                                 }
                             }
                         }
                         "vcpkg" {
                             $res = vcpkg list 2>$null
                             foreach ($line in $res) {
-                                if ($line.Trim()) { $pkgs += ($line.Trim() -replace '\s{2,}', ' | ') }
+                                if ($line.Trim()) {
+                                    $parts = $line -split '\s{2,}'
+                                    if ($parts.Count -ge 2) { $pkgList += [PSCustomObject]@{ Name = $parts[0].Trim(); Version = $parts[1].Trim() } }
+                                }
                             }
                         }
                         "dotnet" {
@@ -255,31 +288,36 @@ function Show-RepairReport {
                             $start = $false
                             foreach ($line in $res) {
                                 if ($line -match "^----+") { $start = $true; continue }
-                                if ($start -and $line.Trim()) { $pkgs += ($line.Trim() -replace '\s{2,}', ' | ') }
+                                if ($start -and $line.Trim()) {
+                                    $parts = $line -split '\s{2,}'
+                                    if ($parts.Count -ge 2) { $pkgList += [PSCustomObject]@{ Name = $parts[0].Trim(); Version = $parts[1].Trim() } }
+                                }
                             }
                         }
                     }
                 }
             } catch {}
 
-            if ($pkgs.Count -gt 0) {
-                $pkgs | Sort-Object | Select-Object -Unique | ForEach-Object {
-                    Write-Host "      -> $_" -ForegroundColor Gray
+            if ($pkgList.Count -gt 0) {
+                $stats["Packages"] += $pkgList.Count
+                Write-Host "      [Packages: $($pkgList.Count)]" -ForegroundColor DarkYellow
+                $displayList = $pkgList | Sort-Object Name
+                foreach ($p in $displayList) {
+                    $verInfo = if ($p.Version) { "($($p.Version))" } else { "" }
+                    Write-Host "        - $($p.Name) $verInfo" -ForegroundColor Gray
                 }
-            } elseif ($found) {
-                Write-Host "      -> (No packages found or command output parsing failed)" -ForegroundColor DarkGray
-            } else {
-                Write-Host "      -> (Manager not installed)" -ForegroundColor DarkGray
             }
-        } else {
-            Write-Host "      -> No valid directories found on disk." -ForegroundColor DarkRed
         }
-        Write-Host ""
     }
     
     Write-Host ("-"*80) -ForegroundColor Cyan
-    Write-Host "[i] Priority enforced: All paths moved to the START of your PATH." -ForegroundColor Gray
-    Write-Host "[i] Manager Paths have higher priority than App Paths within the same tool." -ForegroundColor DarkGray
+    Write-Host " SUMMARY" -ForegroundColor Cyan
+    Write-Host "  Managers Found:   $($stats['Found'])" -ForegroundColor Green
+    Write-Host "  Managers Missing: $($stats['Missing'])" -ForegroundColor Gray
+    Write-Host "  Total Packages:   $($stats['Packages'])" -ForegroundColor Yellow
+    Write-Host ("-"*80) -ForegroundColor Cyan
+    Write-Host "[i] All high-priority tool paths moved to the START of your PATH." -ForegroundColor Gray
+    Write-Host "[i] Tool Path Order: $(($order -join ' > '))" -ForegroundColor DarkGray
     Write-Host ("="*80) -ForegroundColor Cyan
 }
 
@@ -312,20 +350,36 @@ function Repair-And-Prioritize-Paths {
 # --- 主执行流程 ---
 
 Clear-Host
-Write-Host "WinPathFix: Initializing Hierarchical Discovery..." -ForegroundColor Cyan
+$asciiArt = @"
+  _      ___       ____       _   _     _____ _      
+ | |    | (_)     |  _ \     | | | |   |  ___(_)     
+ | |    | |_ _ __ | |_) |__ _| |_| |__ | |_   ___  __
+ | |    | | | '_ \|  __/ _` | __| '_ \|  _| | \ \/ /
+ | |____| | | | | | | | (_| | |_| | | | |   | |>  < 
+ |______|_|_|_| |_|_|  \__,_|\__|_| |_|_|   |_/_/\_\
+                                                     
+     Windows PATH Repair & Optimization Utility
+"@
+
+Write-Host $asciiArt -ForegroundColor Cyan
+Write-Host "`nInitializing Hierarchical Discovery..." -ForegroundColor Gray
 
 # 初始化全局数据
 $Global:DiscoveryData = @{}
 
 # 1. 自动备份
-Invoke-BackupPath | Out-Null
+Write-Host "[*] Creating safety backup..." -NoNewline -ForegroundColor Gray
+$backup = Invoke-BackupPath
+Write-Host " Done." -ForegroundColor Green
 
 # 2. 自动修复
-Write-Host "[*] Analyzing and prioritizing environment variables..." -ForegroundColor Gray
-Repair-And-Prioritize-Paths -EnvTarget User | Out-Null
-try {
-    Repair-And-Prioritize-Paths -EnvTarget Machine | Out-Null
-} catch {}
+if (-not $BackupOnly) {
+    Write-Host "[*] Analyzing and prioritizing environment variables..." -ForegroundColor Gray
+    Repair-And-Prioritize-Paths -EnvTarget User | Out-Null
+    try {
+        Repair-And-Prioritize-Paths -EnvTarget Machine | Out-Null
+    } catch {}
+}
 
 # 3. 输出层次化报告
 Show-RepairReport

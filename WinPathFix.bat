@@ -10,4 +10,4 @@ IF %ERRORLEVEL% NEQ 0 (
 )
 
 cd /d "%~dp0"
-powershell -ExecutionPolicy Bypass -File "WinPathFix.ps1"
+powershell -ExecutionPolicy Bypass -File "WinPathFix.ps1" %*
