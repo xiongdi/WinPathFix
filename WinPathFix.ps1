@@ -1,17 +1,18 @@
 <#
 .SYNOPSIS
-    WinPathFix - Automated Priority-Based Path Repair with Dynamic Discovery.
+    WinPathFix - Automated Priority-Based Path Repair with Deep Package Reporting.
 #>
 
 param (
     [switch]$BackupOnly,
-    [switch]$NonInteractive # Kept for backward compatibility
+    [switch]$NonInteractive
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
 $WarningPreference = 'SilentlyContinue'
 
-# --- 核心工具函数 ---
+# --- 核心数据结构：用于存储发现的路径及其归属 ---
+$Global:DiscoveryData = @{}
 
 function Get-EnvPath {
     param([System.EnvironmentVariableTarget]$Target)
@@ -37,96 +38,122 @@ function Invoke-BackupPath {
     return $backupFile
 }
 
-# --- 动态路径发现逻辑 ---
+# --- 深度路径探测逻辑 ---
 
 function Get-OrderedTargetPaths {
-    $orderedList = New-Object System.Collections.Generic.List[string]
+    $Global:DiscoveryData = @{}
+    $allPaths = New-Object System.Collections.Generic.List[string]
+
+    function Add-Path {
+        param($Name, $Path)
+        if (Test-Path $Path) {
+            $cleanP = $Path.TrimEnd('\')
+            $allPaths.Add($cleanP)
+            if (-not $Global:DiscoveryData.ContainsKey($Name)) { $Global:DiscoveryData[$Name] = New-Object System.Collections.Generic.List[string] }
+            if ($Global:DiscoveryData[$Name] -notcontains $cleanP) { $Global:DiscoveryData[$Name].Add($cleanP) }
+        }
+    }
 
     # 1. WinGet
-    $orderedList.Add("$env:LOCALAPPDATA\Microsoft\WindowsApps")
+    Add-Path "WinGet" "$env:LOCALAPPDATA\Microsoft\WindowsApps"
     $wingetPkg = "$env:LOCALAPPDATA\Microsoft\WinGet\Packages"
     if (Test-Path $wingetPkg) {
         Get-ChildItem -Path $wingetPkg -Directory | ForEach-Object {
-            $orderedList.Add($_.FullName)
+            Add-Path "WinGet" $_.FullName
             $bin = Join-Path $_.FullName "bin"
-            if (Test-Path $bin) { $orderedList.Add($bin) }
+            if (Test-Path $bin) { Add-Path "WinGet" $bin }
         }
     }
 
     # 2. Scoop
     $scoopDir = if ($env:SCOOP) { $env:SCOOP } else { "$env:USERPROFILE\scoop" }
-    $orderedList.Add("$scoopDir\shims")
-    $orderedList.Add("$env:ProgramData\scoop\shims")
+    Add-Path "Scoop" "$scoopDir\shims"
+    Add-Path "Scoop" "$env:ProgramData\scoop\shims"
 
     # 3. Chocolatey
-    $orderedList.Add("$env:ALLUSERSPROFILE\chocolatey\bin")
+    Add-Path "Choco" "$env:ALLUSERSPROFILE\chocolatey\bin"
 
     # 4. Npm
     $npmPrefix = Invoke-Expression "npm config get prefix 2>$null"
     if ($npmPrefix) {
-        $orderedList.Add($npmPrefix.Trim())
-        $orderedList.Add((Join-Path $npmPrefix.Trim() "bin"))
+        $prefix = $npmPrefix.Trim()
+        Add-Path "Npm" $prefix
+        Add-Path "Npm" (Join-Path $prefix "bin")
     }
-    $orderedList.Add("$env:APPDATA\npm")
+    Add-Path "Npm" "$env:APPDATA\npm"
 
     # 5. Pip
     $pyUserBase = Invoke-Expression "python -m site --user-base 2>$null"
     if ($pyUserBase) {
-        $orderedList.Add((Join-Path $pyUserBase.Trim() "Scripts"))
+        Add-Path "Pip" (Join-Path $pyUserBase.Trim() "Scripts")
     }
     $pythonBase = "$env:LOCALAPPDATA\Programs\Python"
     if (Test-Path $pythonBase) {
-        Get-ChildItem -Path $pythonBase -Directory | ForEach-Object { $orderedList.Add("$($_.FullName)\Scripts") }
+        Get-ChildItem -Path $pythonBase -Directory | ForEach-Object { Add-Path "Pip" "$($_.FullName)\Scripts" }
     }
 
     # 6. Cargo
-    $orderedList.Add("$env:USERPROFILE\.cargo\bin")
+    Add-Path "Cargo" "$env:USERPROFILE\.cargo\bin"
 
     # 7. vcpkg
-    if ($env:VCPKG_ROOT) { $orderedList.Add($env:VCPKG_ROOT) }
-    $orderedList.Add("C:\vcpkg")
+    if ($env:VCPKG_ROOT) { Add-Path "vcpkg" $env:VCPKG_ROOT }
+    Add-Path "vcpkg" "C:\vcpkg"
 
     # 8. .NET Tool
-    $orderedList.Add("$env:USERPROFILE\.dotnet\tools")
+    Add-Path "dotnet" "$env:USERPROFILE\.dotnet\tools"
 
-    # 9 & 10. PowerShell
-    $orderedList.Add("$env:ProgramFiles\PowerShell\7")
-    $orderedList.Add("$env:SystemRoot\System32\WindowsPowerShell\v1.0")
+    # 9. PS7
+    Add-Path "PS7" "$env:ProgramFiles\PowerShell\7"
 
-    return $orderedList | Select-Object -Unique
+    # 10. PS5
+    Add-Path "PS5" "$env:SystemRoot\System32\WindowsPowerShell\v1.0"
+
+    return $allPaths | Select-Object -Unique
 }
 
-# --- 核心校验报告逻辑 ---
+# --- 深度校验报告逻辑 ---
 
 function Show-RepairReport {
     $commands = @{
         "WinGet" = "winget"; "Scoop" = "scoop"; "Choco" = "choco";
         "Npm" = "npm"; "Pip" = "pip"; "Cargo" = "cargo";
-        "vcpkg" = "vcpkg"; ".NET" = "dotnet"; "PS7" = "pwsh";
+        "vcpkg" = "vcpkg"; "dotnet" = "dotnet"; "PS7" = "pwsh";
         "PS5" = "powershell"
     }
 
-    Write-Host "`n" + ("="*40) -ForegroundColor Cyan
-    Write-Host "         WINPATHFIX REPAIR REPORT        " -ForegroundColor Cyan
-    Write-Host ("="*40) -ForegroundColor Cyan
+    $order = @("WinGet","Scoop","Choco","Npm","Pip","Cargo","vcpkg","dotnet","PS7","PS5")
+
+    Write-Host "`n" + ("="*60) -ForegroundColor Cyan
+    Write-Host "             WINPATHFIX DEEP REPAIR REPORT             " -ForegroundColor Cyan
+    Write-Host ("="*60) -ForegroundColor Cyan
     
-    foreach ($name in ("WinGet","Scoop","Choco","Npm","Pip","Cargo","vcpkg",".NET","PS7","PS5")) {
+    foreach ($name in $order) {
         $cmd = $commands[$name]
         $found = Get-Command $cmd -ErrorAction SilentlyContinue
+        
+        # 状态标头
         if ($found) {
             Write-Host " [OK] " -NoNewline -ForegroundColor Green
-            Write-Host "$($name.PadRight(10)) -> " -NoNewline
-            Write-Host $found.Source -ForegroundColor Gray
         } else {
             Write-Host " [!!] " -NoNewline -ForegroundColor Red
-            Write-Host "$($name.PadRight(10)) -> " -NoNewline
-            Write-Host "Not found in PATH" -ForegroundColor DarkGray
         }
+        Write-Host "$($name.PadRight(10))" -ForegroundColor White
+        
+        # 展示该工具管理的所有路径
+        if ($Global:DiscoveryData.ContainsKey($name)) {
+            foreach ($path in $Global:DiscoveryData[$name]) {
+                Write-Host "      -> $path" -ForegroundColor Gray
+            }
+        } else {
+            Write-Host "      -> No valid directories found on disk." -ForegroundColor DarkRed
+        }
+        Write-Host ""
     }
-    Write-Host ("-"*40) -ForegroundColor Cyan
-    Write-Host "[i] All targets have been prioritized at the top of your PATH." -ForegroundColor Gray
-    Write-Host "[i] Restart your terminal to apply changes." -ForegroundColor Yellow
-    Write-Host ("="*40) -ForegroundColor Cyan
+    
+    Write-Host ("-"*60) -ForegroundColor Cyan
+    Write-Host "[i] Priority enforced: Above paths are now at the START of your PATH." -ForegroundColor Gray
+    Write-Host "[i] Restart your terminal to refresh the environment." -ForegroundColor Yellow
+    Write-Host ("="*60) -ForegroundColor Cyan
 }
 
 function Repair-And-Prioritize-Paths {
@@ -137,16 +164,13 @@ function Repair-And-Prioritize-Paths {
     
     $validTargets = @()
     foreach ($p in $targetPaths) {
-        $cleanP = $p.TrimEnd('\')
-        if (Test-Path $cleanP -PathType Container) { $validTargets += $cleanP }
+        if (Test-Path $p) { $validTargets += $p }
     }
 
     $remainingPaths = New-Object System.Collections.Generic.List[string]
     foreach ($cp in $currentPaths) {
         $cleanCP = $cp.TrimEnd('\')
-        $isTarget = $false
-        foreach ($vt in $validTargets) { if ($cleanCP -eq $vt) { $isTarget = $true; break } }
-        if (-not $isTarget) { $remainingPaths.Add($cp) }
+        if ($validTargets -notcontains $cleanCP) { $remainingPaths.Add($cp) }
     }
 
     $newPathArray = $validTargets + $remainingPaths.ToArray()
@@ -161,27 +185,24 @@ function Repair-And-Prioritize-Paths {
 # --- 主执行流程 ---
 
 Clear-Host
-Write-Host "WinPathFix: Starting Automated Repair..." -ForegroundColor Cyan
+Write-Host "WinPathFix: Initializing Deep Discovery..." -ForegroundColor Cyan
 
 if ($BackupOnly) {
-    Invoke-BackupPath
+    Invoke-BackupPath | Out-Null
     exit
 }
 
 # 1. 自动备份
 Invoke-BackupPath | Out-Null
 
-# 2. 自动修复
-Write-Host "[*] Discovering and prioritizing paths..." -ForegroundColor Gray
-$userChanged = Repair-And-Prioritize-Paths -EnvTarget User
-$machineChanged = $false
+# 2. 自动修复（此处会填充 DiscoveryData）
+Write-Host "[*] Scanning for package manager installations..." -ForegroundColor Gray
+Repair-And-Prioritize-Paths -EnvTarget User | Out-Null
 try {
-    $machineChanged = Repair-And-Prioritize-Paths -EnvTarget Machine
-} catch {
-    Write-Host "[!] Run as Administrator to repair Machine PATH." -ForegroundColor Yellow
-}
+    Repair-And-Prioritize-Paths -EnvTarget Machine | Out-Null
+} catch {}
 
-# 3. 输出报告
+# 3. 输出深度报告
 Show-RepairReport
 
 if (-not $NonInteractive) {
