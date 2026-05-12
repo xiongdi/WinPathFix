@@ -102,14 +102,15 @@ function Show-RepairReport {
     $commands = @{
         "WinGet" = "winget"; "Scoop" = "scoop"; "Choco" = "choco";
         "Npm" = "npm"; "Pip" = "pip"; "Cargo" = "cargo";
-        "vcpkg" = "vcpkg"; ".NET" = "dotnet"; "PS7" = "pwsh"
+        "vcpkg" = "vcpkg"; ".NET" = "dotnet"; "PS7" = "pwsh";
+        "PS5" = "powershell"
     }
 
     Write-Host "`n" + ("="*40) -ForegroundColor Cyan
     Write-Host "         WINPATHFIX REPAIR REPORT        " -ForegroundColor Cyan
     Write-Host ("="*40) -ForegroundColor Cyan
     
-    foreach ($name in ("WinGet","Scoop","Choco","Npm","Pip","Cargo","vcpkg",".NET","PS7")) {
+    foreach ($name in ("WinGet","Scoop","Choco","Npm","Pip","Cargo","vcpkg",".NET","PS7","PS5")) {
         $cmd = $commands[$name]
         $found = Get-Command $cmd -ErrorAction SilentlyContinue
         if ($found) {
