@@ -1,12 +1,11 @@
 <#
 .SYNOPSIS
-    WinPathFix - Advanced Priority-Based Path Repair with Dynamic Discovery.
+    WinPathFix - Automated Priority-Based Path Repair with Dynamic Discovery.
 #>
 
 param (
-    [switch]$Backup,
-    [switch]$FixPackageManagers,
-    [switch]$NonInteractive
+    [switch]$BackupOnly,
+    [switch]$NonInteractive # Kept for backward compatibility
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -35,14 +34,13 @@ function Invoke-BackupPath {
     }
     $backupData | ConvertTo-Json | Out-File -FilePath $backupFile -Encoding UTF8
     Write-Host "[+] Backup created: $backupFile" -ForegroundColor Green
+    return $backupFile
 }
 
 # --- 动态路径发现逻辑 ---
 
 function Get-OrderedTargetPaths {
     $orderedList = New-Object System.Collections.Generic.List[string]
-
-    Write-Host "[*] Discovering paths from package managers..." -ForegroundColor Gray
 
     # 1. WinGet
     $orderedList.Add("$env:LOCALAPPDATA\Microsoft\WindowsApps")
@@ -55,28 +53,27 @@ function Get-OrderedTargetPaths {
         }
     }
 
-    # 2. Scoop (Dynamic detection)
-    $scoopDir = $env:SCOOP ?: "$env:USERPROFILE\scoop"
+    # 2. Scoop
+    $scoopDir = if ($env:SCOOP) { $env:SCOOP } else { "$env:USERPROFILE\scoop" }
     $orderedList.Add("$scoopDir\shims")
     $orderedList.Add("$env:ProgramData\scoop\shims")
 
     # 3. Chocolatey
     $orderedList.Add("$env:ALLUSERSPROFILE\chocolatey\bin")
 
-    # 4. Npm (Ask npm for its prefix)
-    $npmPrefix = Invoke-Expression "npm config get prefix"
+    # 4. Npm
+    $npmPrefix = Invoke-Expression "npm config get prefix 2>$null"
     if ($npmPrefix) {
         $orderedList.Add($npmPrefix.Trim())
         $orderedList.Add((Join-Path $npmPrefix.Trim() "bin"))
     }
     $orderedList.Add("$env:APPDATA\npm")
 
-    # 5. Pip (Ask Python for user base)
-    $pyUserBase = Invoke-Expression "python -m site --user-base"
+    # 5. Pip
+    $pyUserBase = Invoke-Expression "python -m site --user-base 2>$null"
     if ($pyUserBase) {
         $orderedList.Add((Join-Path $pyUserBase.Trim() "Scripts"))
     }
-    # Fallback to standard python paths
     $pythonBase = "$env:LOCALAPPDATA\Programs\Python"
     if (Test-Path $pythonBase) {
         Get-ChildItem -Path $pythonBase -Directory | ForEach-Object { $orderedList.Add("$($_.FullName)\Scripts") }
@@ -99,25 +96,36 @@ function Get-OrderedTargetPaths {
     return $orderedList | Select-Object -Unique
 }
 
-# --- 核心校验逻辑 ---
+# --- 核心校验报告逻辑 ---
 
-function Verify-PackageManagers {
+function Show-RepairReport {
     $commands = @{
         "WinGet" = "winget"; "Scoop" = "scoop"; "Choco" = "choco";
         "Npm" = "npm"; "Pip" = "pip"; "Cargo" = "cargo";
         "vcpkg" = "vcpkg"; ".NET" = "dotnet"; "PS7" = "pwsh"
     }
 
-    Write-Host "`n[*] Verifying installed commands in PATH:" -ForegroundColor Cyan
-    foreach ($name in $commands.Keys) {
+    Write-Host "`n" + ("="*40) -ForegroundColor Cyan
+    Write-Host "         WINPATHFIX REPAIR REPORT        " -ForegroundColor Cyan
+    Write-Host ("="*40) -ForegroundColor Cyan
+    
+    foreach ($name in ("WinGet","Scoop","Choco","Npm","Pip","Cargo","vcpkg",".NET","PS7")) {
         $cmd = $commands[$name]
         $found = Get-Command $cmd -ErrorAction SilentlyContinue
         if ($found) {
-            Write-Host " [OK] $name -> $($found.Source)" -ForegroundColor Green
+            Write-Host " [OK] " -NoNewline -ForegroundColor Green
+            Write-Host "$($name.PadRight(10)) -> " -NoNewline
+            Write-Host $found.Source -ForegroundColor Gray
         } else {
-            Write-Host " [MISSING] $name" -ForegroundColor Yellow
+            Write-Host " [!!] " -NoNewline -ForegroundColor Red
+            Write-Host "$($name.PadRight(10)) -> " -NoNewline
+            Write-Host "Not found in PATH" -ForegroundColor DarkGray
         }
     }
+    Write-Host ("-"*40) -ForegroundColor Cyan
+    Write-Host "[i] All targets have been prioritized at the top of your PATH." -ForegroundColor Gray
+    Write-Host "[i] Restart your terminal to apply changes." -ForegroundColor Yellow
+    Write-Host ("="*40) -ForegroundColor Cyan
 }
 
 function Repair-And-Prioritize-Paths {
@@ -143,40 +151,39 @@ function Repair-And-Prioritize-Paths {
     $newPathArray = $validTargets + $remainingPaths.ToArray()
     
     if (($currentPaths -join ';') -ne ($newPathArray -join ';')) {
-        Write-Host "[*] Updating $EnvTarget PATH..." -ForegroundColor Yellow
         Set-EnvPath -Target $EnvTarget -PathArray $newPathArray
-        Write-Host "[+] $EnvTarget PATH updated." -ForegroundColor Green
-    } else {
-        Write-Host "[i] $EnvTarget PATH is already optimal." -ForegroundColor DarkGray
+        return $true
     }
+    return $false
 }
 
-function Show-Menu {
-    Clear-Host
-    Write-Host "=========================================" -ForegroundColor Cyan
-    Write-Host "      WinPathFix: Dynamic Discovery      " -ForegroundColor Cyan
-    Write-Host "=========================================" -ForegroundColor Cyan
-    Write-Host "1. Backup PATH"
-    Write-Host "2. Repair & Prioritize (Dynamic Discovery)"
-    Write-Host "3. Verify Current Commands"
-    Write-Host "4. Exit"
-    Write-Host ""
-    
-    $choice = Read-Host "Select (1-4)"
-    switch ($choice) {
-        '1' { Invoke-BackupPath; Pause; Show-Menu }
-        '2' { Invoke-BackupPath; Repair-And-Prioritize-Paths -EnvTarget User; 
-             try { Repair-And-Prioritize-Paths -EnvTarget Machine } catch {}; 
-             Verify-PackageManagers; Pause; Show-Menu }
-        '3' { Verify-PackageManagers; Pause; Show-Menu }
-        '4' { exit }
-        default { Show-Menu }
-    }
+# --- 主执行流程 ---
+
+Clear-Host
+Write-Host "WinPathFix: Starting Automated Repair..." -ForegroundColor Cyan
+
+if ($BackupOnly) {
+    Invoke-BackupPath
+    exit
 }
 
-if ($Backup) { Invoke-BackupPath }
-if ($FixPackageManagers) {
-    Repair-And-Prioritize-Paths -EnvTarget User
-    try { Repair-And-Prioritize-Paths -EnvTarget Machine } catch {}
+# 1. 自动备份
+Invoke-BackupPath | Out-Null
+
+# 2. 自动修复
+Write-Host "[*] Discovering and prioritizing paths..." -ForegroundColor Gray
+$userChanged = Repair-And-Prioritize-Paths -EnvTarget User
+$machineChanged = $false
+try {
+    $machineChanged = Repair-And-Prioritize-Paths -EnvTarget Machine
+} catch {
+    Write-Host "[!] Run as Administrator to repair Machine PATH." -ForegroundColor Yellow
 }
-if (-not $Backup -and -not $FixPackageManagers -and -not $NonInteractive) { Show-Menu }
+
+# 3. 输出报告
+Show-RepairReport
+
+if (-not $NonInteractive) {
+    Write-Host "`nPress any key to exit..."
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+}
