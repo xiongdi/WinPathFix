@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    WinPathFix - Automated Priority-Based Path Repair with Deep Package Reporting.
+    WinPathFix - Hierarchical Priority-Based Path Repair (Manager vs Installed Apps).
 #>
 
 param (
@@ -12,6 +12,7 @@ $ErrorActionPreference = 'SilentlyContinue'
 $WarningPreference = 'SilentlyContinue'
 
 # --- 核心数据结构 ---
+# 结构: @{ "WinGet" = @{ "Manager" = @(); "Apps" = @() } }
 $Global:DiscoveryData = @{}
 
 function Get-EnvPath {
@@ -40,15 +41,15 @@ function Invoke-BackupPath {
 
 # --- 增强的路径发现逻辑 ---
 
-function Add-To-Discovery {
-    param($Name, $Path)
+function Add-Path {
+    param($Name, $Type, $Path)
     if (Test-Path $Path) {
         $cleanP = ($Path).TrimEnd('\')
         if (-not $Global:DiscoveryData.ContainsKey($Name)) { 
-            $Global:DiscoveryData[$Name] = New-Object System.Collections.Generic.List[string] 
+            $Global:DiscoveryData[$Name] = @{ "Manager" = New-Object System.Collections.Generic.List[string]; "Apps" = New-Object System.Collections.Generic.List[string] }
         }
-        if ($Global:DiscoveryData[$Name] -notcontains $cleanP) { 
-            $Global:DiscoveryData[$Name].Add($cleanP) 
+        if ($Global:DiscoveryData[$Name][$Type] -notcontains $cleanP) { 
+            $Global:DiscoveryData[$Name][$Type].Add($cleanP) 
         }
         return $cleanP
     }
@@ -56,79 +57,73 @@ function Add-To-Discovery {
 }
 
 function Get-OrderedTargetPaths {
-    # 注意：不再在这里重置 $Global:DiscoveryData，以便多次调用累加
     $allPaths = New-Object System.Collections.Generic.List[string]
 
-    # 1. WinGet (深度扫描所有子目录下的可执行目录)
-    $wingetPaths = @("$env:LOCALAPPDATA\Microsoft\WindowsApps")
+    # 1. WinGet
+    $res = Add-Path "WinGet" "Manager" "$env:LOCALAPPDATA\Microsoft\WindowsApps"
+    if ($res) { $allPaths.Add($res) }
     $wingetPkg = "$env:LOCALAPPDATA\Microsoft\WinGet\Packages"
     if (Test-Path $wingetPkg) {
-        # 扫描每个包的根目录以及可能包含 exe/dll 的子目录
         Get-ChildItem -Path $wingetPkg -Directory | ForEach-Object {
-            $wingetPaths += $_.FullName
-            # 搜索一级子目录，如果包含 bin 或符合版本号特征的目录
+            $res = Add-Path "WinGet" "Apps" $_.FullName; if ($res) { $allPaths.Add($res) }
             Get-ChildItem -Path $_.FullName -Directory | ForEach-Object {
-                if ($_.Name -match "bin|v\d+|\d+\.\d+") { $wingetPaths += $_.FullName }
+                if ($_.Name -match "bin|v\d+|\d+\.\d+") { $res = Add-Path "WinGet" "Apps" $_.FullName; if ($res) { $allPaths.Add($res) } }
             }
         }
     }
-    foreach ($p in $wingetPaths) { $res = Add-To-Discovery "WinGet" $p; if ($res) { $allPaths.Add($res) } }
 
     # 2. Scoop
     $scoopBase = if ($env:SCOOP) { $env:SCOOP } else { "$env:USERPROFILE\scoop" }
-    $scoopPaths = @("$scoopBase\shims", "$env:ProgramData\scoop\shims")
-    foreach ($p in $scoopPaths) { $res = Add-To-Discovery "Scoop" $p; if ($res) { $allPaths.Add($res) } }
+    $res = Add-Path "Scoop" "Manager" "$scoopBase\shims"; if ($res) { $allPaths.Add($res) }
+    $res = Add-Path "Scoop" "Apps" "$scoopBase\apps"; if ($res) { $allPaths.Add($res) } # Scoop apps root for reference
 
     # 3. Chocolatey
-    $res = Add-To-Discovery "Choco" "$env:ALLUSERSPROFILE\chocolatey\bin"
-    if ($res) { $allPaths.Add($res) }
+    $res = Add-Path "Choco" "Manager" "$env:ALLUSERSPROFILE\chocolatey\bin"; if ($res) { $allPaths.Add($res) }
 
     # 4. Npm
-    $npmPaths = New-Object System.Collections.Generic.List[string]
-    $npmPaths.Add("$env:APPDATA\npm")
-    $npmPaths.Add("$env:ProgramFiles\nodejs")
+    $res = Add-Path "Npm" "Manager" "$env:ProgramFiles\nodejs"; if ($res) { $allPaths.Add($res) }
     try {
         $npmPrefix = (npm config get prefix).Trim()
-        if ($npmPrefix) { $npmPaths.Add($npmPrefix); $npmPaths.Add((Join-Path $npmPrefix "bin")) }
+        if ($npmPrefix) { 
+            $res = Add-Path "Npm" "Apps" $npmPrefix; if ($res) { $allPaths.Add($res) }
+            $res = Add-Path "Npm" "Apps" (Join-Path $npmPrefix "bin"); if ($res) { $allPaths.Add($res) }
+        }
     } catch {}
-    foreach ($p in $npmPaths) { $res = Add-To-Discovery "Npm" $p; if ($res) { $allPaths.Add($res) } }
+    $res = Add-Path "Npm" "Apps" "$env:APPDATA\npm"; if ($res) { $allPaths.Add($res) }
 
     # 5. Pip
-    $pipPaths = New-Object System.Collections.Generic.List[string]
+    $pythonBase = "$env:LOCALAPPDATA\Programs\Python"
+    if (Test-Path $pythonBase) {
+        Get-ChildItem -Path $pythonBase -Directory | ForEach-Object { 
+            $res = Add-Path "Pip" "Manager" $_.FullName; if ($res) { $allPaths.Add($res) }
+            $res = Add-Path "Pip" "Apps" (Join-Path $_.FullName "Scripts"); if ($res) { $allPaths.Add($res) }
+        }
+    }
     try {
         $pyUserBase = (python -m site --user-base).Trim()
-        if ($pyUserBase) { $pipPaths.Add((Join-Path $pyUserBase "Scripts")) }
+        if ($pyUserBase) { $res = Add-Path "Pip" "Apps" (Join-Path $pyUserBase "Scripts"); if ($res) { $allPaths.Add($res) } }
     } catch {}
-    $pythonLocal = "$env:LOCALAPPDATA\Programs\Python"
-    if (Test-Path $pythonLocal) {
-        Get-ChildItem -Path $pythonLocal -Directory | ForEach-Object { $pipPaths.Add((Join-Path $_.FullName "Scripts")) }
-    }
-    foreach ($p in $pipPaths) { $res = Add-To-Discovery "Pip" $p; if ($res) { $allPaths.Add($res) } }
 
     # 6. Cargo
-    $res = Add-To-Discovery "Cargo" "$env:USERPROFILE\.cargo\bin"
-    if ($res) { $allPaths.Add($res) }
+    $res = Add-Path "Cargo" "Manager" "$env:USERPROFILE\.cargo\bin"; if ($res) { $allPaths.Add($res) } # Cargo apps are in bin
 
     # 7. vcpkg
     $vcpkgPaths = @($env:VCPKG_ROOT, "C:\vcpkg", "$env:USERPROFILE\vcpkg")
-    foreach ($p in $vcpkgPaths) { if ($p) { $res = Add-To-Discovery "vcpkg" $p; if ($res) { $allPaths.Add($res) } } }
+    foreach ($p in $vcpkgPaths) { if ($p) { $res = Add-Path "vcpkg" "Manager" $p; if ($res) { $allPaths.Add($res) } } }
 
     # 8. .NET Tool
-    $res = Add-To-Discovery "dotnet" "$env:USERPROFILE\.dotnet\tools"
-    if ($res) { $allPaths.Add($res) }
+    $res = Add-Path "dotnet" "Manager" "$env:USERPROFILE\.dotnet\tools"; if ($res) { $allPaths.Add($res) }
 
     # 9. PS7
-    $res = Add-To-Discovery "PS7" "$env:ProgramFiles\PowerShell\7"
-    if ($res) { $allPaths.Add($res) }
+    $res = Add-Path "PS7" "Manager" "$env:ProgramFiles\PowerShell\7"; if ($res) { $allPaths.Add($res) }
 
     # 10. PS5
-    $res = Add-To-Discovery "PS5" "$env:SystemRoot\System32\WindowsPowerShell\v1.0"
-    if ($res) { $allPaths.Add($res) }
+    $res = Add-Path "PS5" "Manager" "$env:SystemRoot\System32\WindowsPowerShell\v1.0"; if ($res) { $allPaths.Add($res) }
 
     return $allPaths | Select-Object -Unique
 }
 
-# --- 深度报告逻辑 ---
+# --- 层次化报告逻辑 ---
 
 function Show-RepairReport {
     $commands = @{
@@ -140,14 +135,15 @@ function Show-RepairReport {
 
     $order = @("WinGet","Scoop","Choco","Npm","Pip","Cargo","vcpkg","dotnet","PS7","PS5")
 
-    Write-Host "`n" + ("="*70) -ForegroundColor Cyan
-    Write-Host "             WINPATHFIX DEEP REPAIR REPORT (v2.0)             " -ForegroundColor Cyan
-    Write-Host ("="*70) -ForegroundColor Cyan
+    Write-Host "`n" + ("="*80) -ForegroundColor Cyan
+    Write-Host "             WINPATHFIX HIERARCHICAL REPAIR REPORT             " -ForegroundColor Cyan
+    Write-Host ("="*80) -ForegroundColor Cyan
     
     foreach ($name in $order) {
         $cmd = $commands[$name]
         $found = Get-Command $cmd -ErrorAction SilentlyContinue
         
+        # 1. 一级：管理器状态
         if ($found) {
             Write-Host " [OK] " -NoNewline -ForegroundColor Green
         } else {
@@ -155,26 +151,32 @@ function Show-RepairReport {
         }
         Write-Host "$($name.PadRight(10))" -ForegroundColor White
         
-        if ($Global:DiscoveryData.ContainsKey($name) -and $Global:DiscoveryData[$name].Count -gt 0) {
-            foreach ($path in $Global:DiscoveryData[$name]) {
-                Write-Host "      -> $path" -ForegroundColor Gray
+        if ($Global:DiscoveryData.ContainsKey($name)) {
+            # 2. 展示管理器自身路径
+            if ($Global:DiscoveryData[$name]["Manager"].Count -gt 0) {
+                Write-Host "      [Manager Path]" -ForegroundColor DarkCyan
+                foreach ($path in $Global:DiscoveryData[$name]["Manager"]) {
+                    Write-Host "      -> $path" -ForegroundColor Gray
+                }
+            }
+
+            # 3. 展示安装的软件路径
+            if ($Global:DiscoveryData[$name]["Apps"].Count -gt 0) {
+                Write-Host "      [Installed Software Paths]" -ForegroundColor DarkYellow
+                foreach ($path in $Global:DiscoveryData[$name]["Apps"]) {
+                    Write-Host "      -> $path" -ForegroundColor Gray
+                }
             }
         } else {
-            # 兜底：如果命令存在但没找到目录，尝试从 Get-Command 获取
-            if ($found) {
-                $guessedDir = Split-Path $found.Source
-                Write-Host "      -> $guessedDir (Detected via command source)" -ForegroundColor DarkGray
-            } else {
-                Write-Host "      -> No valid directories found on disk." -ForegroundColor DarkRed
-            }
+            Write-Host "      -> No valid directories found on disk." -ForegroundColor DarkRed
         }
         Write-Host ""
     }
     
-    Write-Host ("-"*70) -ForegroundColor Cyan
-    Write-Host "[i] Priority enforced: Above paths are now at the START of your PATH." -ForegroundColor Gray
-    Write-Host "[i] Restart your terminal to refresh the environment." -ForegroundColor Yellow
-    Write-Host ("="*70) -ForegroundColor Cyan
+    Write-Host ("-"*80) -ForegroundColor Cyan
+    Write-Host "[i] Priority enforced: All paths moved to the START of your PATH." -ForegroundColor Gray
+    Write-Host "[i] Manager Paths have higher priority than App Paths within the same tool." -ForegroundColor DarkGray
+    Write-Host ("="*80) -ForegroundColor Cyan
 }
 
 function Repair-And-Prioritize-Paths {
@@ -206,28 +208,22 @@ function Repair-And-Prioritize-Paths {
 # --- 主执行流程 ---
 
 Clear-Host
-Write-Host "WinPathFix: Initializing Deep Discovery v2.0..." -ForegroundColor Cyan
+Write-Host "WinPathFix: Initializing Hierarchical Discovery..." -ForegroundColor Cyan
 
-if ($BackupOnly) {
-    Invoke-BackupPath | Out-Null
-    exit
-}
-
-# 初始化数据
+# 初始化全局数据
 $Global:DiscoveryData = @{}
 
 # 1. 自动备份
 Invoke-BackupPath | Out-Null
 
 # 2. 自动修复
-Write-Host "[*] Scanning and optimizing path priority..." -ForegroundColor Gray
-# 按顺序运行，DiscoveryData 会在调用过程中被填充
+Write-Host "[*] Analyzing and prioritizing environment variables..." -ForegroundColor Gray
 Repair-And-Prioritize-Paths -EnvTarget User | Out-Null
 try {
     Repair-And-Prioritize-Paths -EnvTarget Machine | Out-Null
 } catch {}
 
-# 3. 输出报告
+# 3. 输出层次化报告
 Show-RepairReport
 
 if (-not $NonInteractive) {
