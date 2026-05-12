@@ -152,20 +152,124 @@ function Show-RepairReport {
         Write-Host "$($name.PadRight(10))" -ForegroundColor White
         
         if ($Global:DiscoveryData.ContainsKey($name)) {
-            # 2. 展示管理器自身路径
-            if ($Global:DiscoveryData[$name]["Manager"].Count -gt 0) {
+            # 2. 一级展示包管理器执行文件的路径
+            $managerExe = $null
+            if ($found) {
+                $managerExe = $found.Path
+            } else {
+                $exts = @('.exe', '.cmd', '.bat', '.ps1', '')
+                foreach ($dir in $Global:DiscoveryData[$name]["Manager"]) {
+                    foreach ($ext in $exts) {
+                        $testPath = Join-Path $dir "$cmd$ext"
+                        if (Test-Path $testPath -PathType Leaf) {
+                            $managerExe = $testPath
+                            break
+                        }
+                    }
+                    if ($managerExe) { break }
+                }
+            }
+
+            if ($managerExe) {
+                Write-Host "      [Manager Executable]" -ForegroundColor DarkCyan
+                Write-Host "      -> $managerExe" -ForegroundColor Gray
+            } elseif ($Global:DiscoveryData[$name]["Manager"].Count -gt 0) {
                 Write-Host "      [Manager Path]" -ForegroundColor DarkCyan
                 foreach ($path in $Global:DiscoveryData[$name]["Manager"]) {
                     Write-Host "      -> $path" -ForegroundColor Gray
                 }
             }
 
-            # 3. 展示安装的软件路径
-            if ($Global:DiscoveryData[$name]["Apps"].Count -gt 0) {
-                Write-Host "      [Installed Software Paths]" -ForegroundColor DarkYellow
-                foreach ($path in $Global:DiscoveryData[$name]["Apps"]) {
-                    Write-Host "      -> $path" -ForegroundColor Gray
+            # 3. 二级展示通过此包管理器安装的软件包
+            Write-Host "      [Installed Packages]" -ForegroundColor DarkYellow
+            $pkgs = @()
+            try {
+                if ($found) {
+                    switch ($name) {
+                        "WinGet" {
+                            $res = winget list --source winget --accept-source-agreements 2>$null
+                            $start = $false
+                            $idIdx = -1
+                            foreach ($line in $res) {
+                                if (-not $start -and $line -match '\sID\s') {
+                                    $idIdx = $line.IndexOf("ID")
+                                }
+                                if ($line -match "^-+") { $start = $true; continue }
+                                if ($start -and $line.Trim()) {
+                                    if ($idIdx -gt 0 -and $line.Length -gt $idIdx) {
+                                        $info = $line.Substring($idIdx).Trim() -replace '\s{2,}', ' | '
+                                        if ($info) { $pkgs += $info }
+                                    } else {
+                                        $info = $line.Trim() -replace '\s{2,}', ' | '
+                                        if ($info) { $pkgs += $info }
+                                    }
+                                }
+                            }
+                        }
+                        "Scoop" {
+                            $res = scoop list 6>$null 2>$null
+                            foreach ($item in $res) {
+                                if ($item -and $item.Name) { 
+                                    $info = "$($item.Name) | $($item.Version)"
+                                    if ($item.Source) { $info += " | $($item.Source)" }
+                                    $pkgs += $info 
+                                }
+                            }
+                        }
+                        "Choco" {
+                            $res = choco list -l -r 2>$null
+                            foreach ($line in $res) {
+                                if ($line.Trim()) { $pkgs += ($line.Trim() -replace '\|', ' | ') }
+                            }
+                        }
+                        "Npm" {
+                            $res = npm ls -g --depth=0 2>$null | Select-Object -Skip 1
+                            foreach ($line in $res) {
+                                if ($line -match "(\+--|`--|├──|└──)\s+(.+)") { 
+                                    $pkgs += $matches[2]
+                                }
+                            }
+                        }
+                        "Pip" {
+                            $res = pip list -v --format=columns 2>$null | Select-Object -Skip 2
+                            foreach ($line in $res) {
+                                if ($line.Trim()) { $pkgs += ($line.Trim() -replace '\s{2,}', ' | ') }
+                            }
+                        }
+                        "Cargo" {
+                            $res = cargo install --list 2>$null
+                            foreach ($line in $res) {
+                                if ($line -match "^([a-zA-Z0-9_-]+)\s+(v[0-9.]+):") { 
+                                    $pkgs += "$($matches[1]) | $($matches[2])" 
+                                }
+                            }
+                        }
+                        "vcpkg" {
+                            $res = vcpkg list 2>$null
+                            foreach ($line in $res) {
+                                if ($line.Trim()) { $pkgs += ($line.Trim() -replace '\s{2,}', ' | ') }
+                            }
+                        }
+                        "dotnet" {
+                            $res = dotnet tool list -g 2>$null
+                            $start = $false
+                            foreach ($line in $res) {
+                                if ($line -match "^----+") { $start = $true; continue }
+                                if ($start -and $line.Trim()) { $pkgs += ($line.Trim() -replace '\s{2,}', ' | ') }
+                            }
+                        }
+                    }
                 }
+            } catch {}
+
+            if ($pkgs.Count -gt 0) {
+                $pkgs | Sort-Object | Select-Object -Unique | ForEach-Object {
+                    Write-Host "      -> $_" -ForegroundColor Gray
+                }
+            } elseif ($found) {
+                Write-Host "      -> (No packages found or command output parsing failed)" -ForegroundColor DarkGray
+            } else {
+                Write-Host "      -> (Manager not installed)" -ForegroundColor DarkGray
             }
         } else {
             Write-Host "      -> No valid directories found on disk." -ForegroundColor DarkRed
