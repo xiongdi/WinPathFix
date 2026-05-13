@@ -36,6 +36,15 @@ function Set-EnvPath {
         return
     }
     [Environment]::SetEnvironmentVariable('Path', $newPath, $Target)
+    
+    # Update the current process PATH so the current shell is immediately aware of the changes
+    $processPath = [Environment]::GetEnvironmentVariable('Path', 'Process')
+    if ($Target -eq 'Machine' -or $Target -eq 'User') {
+        # Recalculate Process PATH by combining Machine and User paths
+        $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+        [Environment]::SetEnvironmentVariable('Path', "$machinePath;$userPath", 'Process')
+    }
 }
 
 function Invoke-BackupPath {
@@ -383,6 +392,9 @@ if (-not $BackupOnly) {
 
 # 3. 输出层次化报告
 Show-RepairReport
+
+Write-Host "`n[!] IMPORTANT: PATH changes have been saved to the registry." -ForegroundColor Yellow
+Write-Host "[!] You MUST RESTART any existing cmd or pwsh windows (or your IDE) for the changes to take effect." -ForegroundColor Yellow
 
 if (-not $NonInteractive) {
     Write-Host "`nPress any key to exit..."
